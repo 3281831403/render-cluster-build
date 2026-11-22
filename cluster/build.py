@@ -15,6 +15,28 @@ Common conventions
 * Angles exposed by this module are in degrees, never radians.
 """
 
+import math
+
+TOL = 1e-9
+
+
+def _centroid(tri: dict) -> tuple[float, float, float]:
+    (ax, ay, az), (bx, by, bz), (cx, cy, cz) = tri["vertices"]
+    return ((ax + bx + cx) / 3.0, (ay + by + cy) / 3.0, (az + bz + cz) / 3.0)
+
+
+def _dist(a, b) -> float:
+    return math.sqrt(
+        (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2
+    )
+
+
+def _normalize(v):
+    length = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    if length <= TOL:
+        raise ValueError("zero-length vector")
+    return (v[0] / length, v[1] / length, v[2] / length)
+
 
 def cluster_triangles(tris: list[dict], capacity: int) -> list[list[int]]:
     """Partition triangle indices into deterministic spatial clusters.
@@ -38,7 +60,39 @@ def cluster_triangles(tris: list[dict], capacity: int) -> list[list[int]]:
     normal cone.  The returned lists must be new lists; never expose or mutate
     an input structure.  Geometric tie comparisons use a tolerance of ``1e-9``.
     """
-    raise NotImplementedError("cluster_triangles")
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
+        raise ValueError("capacity must be an integer >= 1")
+
+    centroids = [_centroid(tri) for tri in tris]
+    unassigned = set(range(len(tris)))
+    clusters: list[list[int]] = []
+
+    while unassigned:
+        seed = min(unassigned)
+        unassigned.remove(seed)
+        cluster = [seed]
+        # Cluster centroid: mean of member triangle centroids.
+        cx, cy, cz = centroids[seed]
+
+        while unassigned and len(cluster) < capacity:
+            best_idx = None
+            best_d = None
+            for idx in sorted(unassigned):
+                d = _dist(centroids[idx], (cx, cy, cz))
+                if best_d is None or d < best_d - TOL:
+                    best_d = d
+                    best_idx = idx
+            unassigned.remove(best_idx)
+            cluster.append(best_idx)
+            n = len(cluster)
+            cx = (cx * (n - 1) + centroids[best_idx][0]) / n
+            cy = (cy * (n - 1) + centroids[best_idx][1]) / n
+            cz = (cz * (n - 1) + centroids[best_idx][2]) / n
+
+        clusters.append(sorted(cluster))
+
+    clusters.sort(key=lambda c: c[0])
+    return clusters
 
 
 def cluster_bounds(cluster: list[int], tris: list[dict]) -> dict:
@@ -54,7 +108,25 @@ def cluster_bounds(cluster: list[int], tris: list[dict]) -> dict:
     An empty cluster raises ``ValueError``.  Coordinates are floats conceptually;
     compare them with an absolute tolerance of ``1e-9``.
     """
-    raise NotImplementedError("cluster_bounds")
+    if not cluster:
+        raise ValueError("empty cluster")
+
+    mins = [math.inf, math.inf, math.inf]
+    maxs = [-math.inf, -math.inf, -math.inf]
+    for idx in cluster:
+        for vertex in tris[idx]["vertices"]:
+            for axis in range(3):
+                value = vertex[axis]
+                if value < mins[axis]:
+                    mins[axis] = value
+                if value > maxs[axis]:
+                    maxs[axis] = value
+
+    return {
+        "min": tuple(mins),
+        "max": tuple(maxs),
+        "center": tuple((mins[a] + maxs[a]) / 2.0 for a in range(3)),
+    }
 
 
 def cluster_cone(cluster: list[int], tris: list[dict]) -> dict:
@@ -73,7 +145,29 @@ def cluster_cone(cluster: list[int], tris: list[dict]) -> dict:
     ``1e-9`` (the directions cancel), raise ``ValueError`` because the axis is
     undefined.
     """
-    raise NotImplementedError("cluster_cone")
+    if not cluster:
+        raise ValueError("empty cluster")
+
+    normals = [_normalize(tris[idx]["normal"]) for idx in cluster]
+    mean = (
+        sum(n[0] for n in normals) / len(normals),
+        sum(n[1] for n in normals) / len(normals),
+        sum(n[2] for n in normals) / len(normals),
+    )
+    mean_len = math.sqrt(mean[0] ** 2 + mean[1] ** 2 + mean[2] ** 2)
+    if mean_len <= TOL:
+        raise ValueError("mean normal is zero; cone axis undefined")
+    axis = (mean[0] / mean_len, mean[1] / mean_len, mean[2] / mean_len)
+
+    half_angle = 0.0
+    for n in normals:
+        dot = axis[0] * n[0] + axis[1] * n[1] + axis[2] * n[2]
+        dot = max(-1.0, min(1.0, dot))
+        angle = math.degrees(math.acos(dot))
+        if angle > half_angle:
+            half_angle = angle
+
+    return {"axis": axis, "half_angle": half_angle}
 
 
 def merge_small(clusters: list[dict], min_tris: int) -> list[list[int]]:
@@ -97,7 +191,36 @@ def merge_small(clusters: list[dict], min_tris: int) -> list[list[int]]:
     nearest neighbour widens cones and is not acceptable.  Distance ties use an
     absolute tolerance of ``1e-9``.
     """
-    raise NotImplementedError("merge_small")
+    # Work on private copies so the input records are never mutated.
+    records = [
+        {"indices": list(record["indices"]), "center": tuple(record["center"])}
+        for record in clusters
+    ]
+
+    if min_tris > 0:
+        for pos in range(len(records)):
+            record = records[pos]
+            if record is None or len(record["indices"]) >= min_tris:
+                continue
+            # Find the nearest other present cluster; ties go to the lower
+            # original position (scan order is ascending position).
+            best_pos = None
+            best_d = None
+            for other_pos in range(len(records)):
+                if other_pos == pos or records[other_pos] is None:
+                    continue
+                d = _dist(record["center"], records[other_pos]["center"])
+                if best_d is None or d < best_d - TOL:
+                    best_d = d
+                    best_pos = other_pos
+            if best_pos is None:
+                continue  # No other cluster: leave the small one in place.
+            records[best_pos]["indices"].extend(record["indices"])
+            records[pos] = None
+
+    survivors = [sorted(r["indices"]) for r in records if r is not None]
+    survivors.sort(key=lambda c: c[0])
+    return survivors
 
 
 def coverage(clusters: list[list[int]], tris: list[dict]) -> float:
@@ -115,7 +238,10 @@ def coverage(clusters: list[list[int]], tris: list[dict]) -> float:
     structural validation belongs to ``validate_clusters``.  The result is in
     ``[0, 1]``; compare it with an absolute tolerance of ``1e-9``.
     """
-    raise NotImplementedError("coverage")
+    if not tris:
+        return 1.0
+    referenced = {idx for cluster in clusters for idx in cluster}
+    return len(referenced) / len(tris)
 
 
 def lod_switch(
@@ -142,7 +268,27 @@ def lod_switch(
     Mean-distance and threshold comparisons use an absolute tolerance of
     ``1e-9``.
     """
-    raise NotImplementedError("lod_switch")
+    n = len(distance)
+    seen: set[int] = set()
+    for cluster in clusters:
+        if not cluster:
+            raise ValueError("empty cluster")
+        for idx in cluster:
+            if idx < 0 or idx >= n:
+                raise ValueError(f"index {idx} out of range")
+            if idx in seen:
+                raise ValueError(f"duplicate index {idx}")
+            seen.add(idx)
+    if len(seen) != n:
+        raise ValueError("clusters do not cover every triangle")
+
+    result = [0] * n
+    for cluster in clusters:
+        mean = sum(distance[idx] for idx in cluster) / len(cluster)
+        lod = sum(1 for t in thresholds if t < mean - TOL)
+        for idx in cluster:
+            result[idx] = lod
+    return result
 
 
 def validate_clusters(clusters: list[list[int]], tris: list[dict]) -> list[str]:
@@ -164,7 +310,21 @@ def validate_clusters(clusters: list[list[int]], tris: list[dict]) -> list[str]:
     Integer index checks are exact; the geometric tolerance of ``1e-9`` does not
     apply to this function.
     """
-    raise NotImplementedError("validate_clusters")
+    issues: list[str] = []
+    seen: set[int] = set()
+    for ci, cluster in enumerate(clusters):
+        if not cluster:
+            issues.append(f"cluster {ci}: empty")
+            continue
+        for idx in cluster:
+            if idx < 0 or idx >= len(tris):
+                issues.append(f"cluster {ci}: index {idx} out of range")
+                continue
+            if idx in seen:
+                issues.append(f"duplicate triangle {idx}")
+            else:
+                seen.add(idx)
+    return issues
 
 
 def cluster_batch(meshes: list[dict], config: dict) -> dict:
@@ -184,4 +344,14 @@ def cluster_batch(meshes: list[dict], config: dict) -> dict:
     Per-mesh clustering follows the same ordering and uses the same absolute
     tolerance of ``1e-9`` as ``cluster_triangles``.
     """
-    raise NotImplementedError("cluster_batch")
+    capacity = config.get("capacity")
+    if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity < 1:
+        raise ValueError("config must contain a positive integer capacity")
+
+    result: dict[str, list[list[int]]] = {}
+    for mesh in meshes:
+        name = mesh["name"]
+        if name in result:
+            raise ValueError(f"duplicate mesh name {name!r}")
+        result[name] = cluster_triangles(mesh["triangles"], capacity)
+    return result
